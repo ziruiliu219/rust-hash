@@ -235,18 +235,16 @@ impl TaperHashMap {
         }
     }
 
-    // ─── Full batch emplace with collision retry + prefetch ─────────────────────
-    // Mirrors C++ EmplaceBatchImpl:
-    // 1. Precompute all hash values and target chunk positions
-    // 2. First pass: try emplace each row at its target chunk, collect collisions
-    // 3. Collision retry loop: update positions, prefetch, retry until all inserted
+    // ─── Full batch emplace matching C++ EmplaceBatchImpl exactly ──────────────
+    //
+    // Flow (same as OmniOperator taper_hashtable.h):
+    // 1. If Capacity < numRows → fallback to EmplaceBatchDirectly (per-row emplace)
+    // 2. ResetEmplaceContext: precompute hash values + chunk positions for all rows
+    // 3. First pass: per-row TryEmplaceAtPos, collect collisions with rehash positions
+    //    - On expand: tryEmplaceRehashedCollisions + resetPositions for remaining
+    // 4. Collision while loop: iterate collisions, increment collisionBatch each round
+    //    - On expand: same resizeProc
 
-    /// Batch emplace matching C++ `EmplaceBatchImpl`:
-    /// - First pass tries each row once at its initial target chunk with prefetch
-    /// - Rows that collide (chunk full) are collected
-    /// - Collision rows get new target positions, prefetched, and retried in batches
-    ///
-    /// This ensures ALL chunk accesses (including collision retries) are prefetched.
     pub fn emplace_batch_full<FKeyCmp, FInit, FUpdate>(
         &mut self,
         hashes: &[u64],
@@ -258,91 +256,152 @@ impl TaperHashMap {
         FInit: FnMut(usize, &mut SlotValue),
         FUpdate: FnMut(usize, &SlotValue, bool),
     {
-        let n = hashes.len();
-        if n == 0 {
+        let num_rows = hashes.len();
+        if num_rows == 0 { return; }
+
+        if self.capacity() < num_rows {
+            // EmplaceBatchDirectly fallback
+            for i in 0..num_rows {
+                let h = hashes[i];
+                let mut row_init = |slot: &mut SlotValue| on_init(i, slot);
+                let mut row_update = |slot: &SlotValue, is_new: bool| on_update(i, slot, is_new);
+                self.emplace(h, &|slot| key_cmp(i, slot), &mut row_init, &mut row_update);
+            }
             return;
         }
 
-        // Precompute target chunk positions (mirrors C++ ResetEmplaceContext)
-        let mut positions: Vec<usize> = hashes.iter().map(|&h| self.chunk_pos(h)).collect();
+        // ResetEmplaceContext: precompute hash values and chunk positions
+        let mut emplace_hash_vals: Vec<u64> = hashes.iter().map(|&h| h).collect(); // Hash(key)=key for KeyScattered
+        let mut emplace_positions: Vec<usize> = emplace_hash_vals.iter().map(|&h| self.chunk_pos(h)).collect();
+        let mut emplace_collisions: Vec<u32> = vec![0u32; num_rows];
 
-        // Active row indices — starts as all rows
-        let mut active: Vec<u32> = (0..n as u32).collect();
-        let mut collision_buf: Vec<u32> = Vec::new();
-        let mut collision_batch = 1usize;
+        let mut collision_batch: usize = 1;
+        let mut collision_count: usize = 0;
 
-        loop {
-            let count = active.len();
-            if count == 0 {
-                break;
+        // Helper: reset positions from hash values (after expand)
+        let reset_positions = |positions: &mut [usize], hash_vals: &[u64], begin: usize, end: usize, mask: usize| {
+            for i in begin..end {
+                positions[i] = (hash_vals[i] as usize) & mask;
             }
+        };
 
-            // Check expansion before this batch
-            if self.should_expand() {
-                self.expand();
-                // Recompute positions for remaining active rows
-                for &row_idx in &active {
-                    positions[row_idx as usize] = self.chunk_pos(hashes[row_idx as usize]);
+        // Helper: prefetch
+        let prefetch_idx = |positions: &[usize], idx: usize, end: usize, chunks: &[Chunk]| {
+            let pi = idx + PREFETCH_DIST;
+            if pi < end {
+                let pos = positions[pi];
+                let ptr = chunks.as_ptr();
+                unsafe {
+                    let chunk_ptr = (ptr as *const u8).add(pos * std::mem::size_of::<Chunk>());
+                    Self::prefetch_read(chunk_ptr);
+                    Self::prefetch_read(chunk_ptr.add(64));
                 }
-                collision_batch = 1;
             }
+        };
 
-            // Prefetch first PREFETCH_DIST target chunks
-            for pi in 0..PREFETCH_DIST.min(count) {
-                self.prefetch_chunk(positions[active[pi] as usize]);
-            }
-
-            collision_buf.clear();
-
-            for idx in 0..count {
-                // Prefetch ahead
-                let pi = idx + PREFETCH_DIST;
-                if pi < count {
-                    self.prefetch_chunk(positions[active[pi] as usize]);
-                }
-
-                let row_idx = active[idx] as usize;
-                let hash = hashes[row_idx];
-                let pos = positions[row_idx];
-                let tag_hash = ((hash >> 16) & 0x7F) as u8;
-
-                let chunk = &mut self.chunks[pos];
+        // TryEmplaceAtPos: returns true if succeeded
+        // We need a macro-like approach since we can't borrow self mutably in a closure
+        macro_rules! try_emplace_at_pos {
+            ($self:expr, $hash:expr, $pos:expr, $row_idx:expr) => {{
+                let chunk = &mut $self.chunks[$pos];
+                let tag_hash = (($hash >> 16) & 0x7F) as u8;
                 let tags = chunk.tags_u64();
+                let mut succeeded = false;
 
-                // Try tag+key match (existing group)
-                let mut found = false;
+                // Tag match → KeyEquals (int64 ==)
                 for i in BitMask::match_tag(tags, tag_hash) {
                     let slot = i as usize;
-                    if chunk.keys[slot] == hash && key_cmp(row_idx, &chunk.values[slot]) {
-                        on_update(row_idx, &chunk.values[slot], false);
-                        found = true;
+                    if chunk.keys[slot] == $hash {
+                        on_update($row_idx, &chunk.values[slot], false);
+                        succeeded = true;
                         break;
                     }
                 }
-                if found {
-                    continue;
-                }
 
-                // Try empty slot (new group)
-                if let Some(i) = BitMask::match_empty(tags).next() {
-                    let slot = i as usize;
-                    chunk.tags[slot] = tag_hash;
-                    chunk.keys[slot] = hash;
-                    on_init(row_idx, &mut chunk.values[slot]);
-                    on_update(row_idx, &chunk.values[slot], true);
-                    self.size += 1;
-                } else {
-                    // Chunk full → record collision, update position for next round
-                    positions[row_idx] = self.rehash_pos(collision_batch, pos);
-                    collision_buf.push(row_idx as u32);
+                if !succeeded {
+                    // Empty slot
+                    if let Some(i) = BitMask::match_empty(tags).next() {
+                        let slot = i as usize;
+                        $self.size += 1;
+                        chunk.tags[slot] = tag_hash;
+                        chunk.keys[slot] = $hash;
+                        on_init($row_idx, &mut chunk.values[slot]);
+                        on_update($row_idx, &chunk.values[slot], true);
+                        succeeded = true;
+                    }
+                }
+                succeeded
+            }};
+        }
+
+        // tryEmplaceRehashedCollisions
+        macro_rules! try_emplace_rehashed_collisions {
+            ($self:expr) => {{
+                // Reset positions for collision elements
+                for i in 0..collision_count {
+                    emplace_positions[i] = ($self.chunks.len() - 1) & (emplace_hash_vals[i] as usize);
+                }
+                let cur_count = collision_count;
+                collision_count = 0;
+                for idx in 0..cur_count {
+                    prefetch_idx(&emplace_positions, idx, cur_count, &$self.chunks);
+                    let row_idx = emplace_collisions[idx] as usize;
+                    // During rehashed collisions, just try once (guaranteed to succeed post-expand)
+                    try_emplace_at_pos!($self, hashes[row_idx], emplace_positions[idx], row_idx);
+                }
+            }};
+        }
+
+        // First pass: try emplace all rows
+        for i in 0..num_rows {
+            prefetch_idx(&emplace_positions, i, num_rows, &self.chunks);
+
+            let ok = try_emplace_at_pos!(self, emplace_hash_vals[i], emplace_positions[i], i);
+
+            if !ok {
+                emplace_collisions[collision_count] = i as u32;
+                emplace_hash_vals[collision_count] = emplace_hash_vals[i];
+                emplace_positions[collision_count] = self.rehash_pos(collision_batch, emplace_positions[i]);
+                collision_count += 1;
+                if self.should_expand() {
+                    self.expand();
+                    // resizeProc
+                    collision_batch = 1;
+                    try_emplace_rehashed_collisions!(self);
+                    let mask = self.mask;
+                    reset_positions(&mut emplace_positions, &emplace_hash_vals, i + 1, num_rows, mask);
                 }
             }
+        }
 
-            if collision_buf.is_empty() {
-                break;
-            }
-            std::mem::swap(&mut active, &mut collision_buf);
+        // Collision iteration (same while loop as OmniOperator)
+        while collision_count > 0 {
+            let cur_count = collision_count;
+            collision_count = 0;
             collision_batch += 1;
+
+            for idx in 0..cur_count {
+                prefetch_idx(&emplace_positions, idx, cur_count, &self.chunks);
+                let row_idx = emplace_collisions[idx] as usize;
+
+                let ok = try_emplace_at_pos!(self, hashes[row_idx], emplace_positions[idx], row_idx);
+
+                if !ok {
+                    emplace_collisions[collision_count] = row_idx as u32;
+                    emplace_hash_vals[collision_count] = emplace_hash_vals[idx];
+                    emplace_positions[collision_count] = self.rehash_pos(collision_batch, emplace_positions[idx]);
+                    collision_count += 1;
+                    if self.should_expand() {
+                        self.expand();
+                        collision_batch = 1;
+                        try_emplace_rehashed_collisions!(self);
+                        let mask = self.mask;
+                        for ii in (idx + 1)..cur_count {
+                            emplace_positions[ii] = (emplace_hash_vals[ii] as usize) & mask;
+                        }
+                    }
+                }
+            }
         }
     }
 
