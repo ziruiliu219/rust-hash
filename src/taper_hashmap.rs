@@ -11,14 +11,34 @@ const PREFETCH_DIST: usize = 16;
 /// TaperHashMap: chunked open-addressing hash table.
 /// Key = u64 (hash value), Value = 6-byte compressed pointer.
 ///
-/// Design mirrors C++ TaperHashTable:
-/// - `emplace` processes ONE row (matching C++ TryEmplaceAtPos + EmplaceImpl loop)
-/// - `emplace_batch` loops over rows with software prefetch (matching C++ EmplaceBatchDirectly)
-/// - `expand` uses iterative batch rehash with prefetch (matching C++ RehashBatch)
+/// Memory allocation: uses libc::posix_memalign(128) + memset(0x80) to match
+/// OmniOperator's Allocator::Alloc for chunk memory. This ensures identical
+/// memory layout and TLB/cache behavior as the C++ version.
 pub struct TaperHashMap {
-    chunks: Vec<Chunk>,
+    chunks: *mut Chunk,
+    num_chunks: usize,
     size: usize,
-    mask: usize, // chunks.len() - 1 (power of 2)
+    mask: usize, // num_chunks - 1 (power of 2)
+}
+
+impl Drop for TaperHashMap {
+    fn drop(&mut self) {
+        if !self.chunks.is_null() {
+            unsafe { libc::free(self.chunks as *mut libc::c_void); }
+            self.chunks = std::ptr::null_mut();
+        }
+    }
+}
+
+/// Allocate chunk memory via posix_memalign(128) + memset(0x80).
+/// Matches OmniOperator: Allocator::Alloc(bytes) + memset(kEmptyTag).
+unsafe fn alloc_chunks(num_chunks: usize) -> *mut Chunk {
+    let bytes = num_chunks * std::mem::size_of::<Chunk>();
+    let mut ptr: *mut libc::c_void = std::ptr::null_mut();
+    let rc = libc::posix_memalign(&mut ptr, 128, bytes);
+    assert!(rc == 0 && !ptr.is_null(), "posix_memalign failed");
+    libc::memset(ptr, 0x80i32, bytes); // kEmptyTag = 0x80
+    ptr as *mut Chunk
 }
 
 impl TaperHashMap {
@@ -28,13 +48,13 @@ impl TaperHashMap {
     }
 
     /// Create with specified number of chunks (must be power of 2).
-    /// This is the primary constructor for benchmark use.
     pub fn with_capacity(num_chunks: usize) -> Self {
         let num_chunks = num_chunks.max(1).next_power_of_two();
-        let chunks: Vec<Chunk> = (0..num_chunks).map(|_| Chunk::new()).collect();
+        let chunks = unsafe { alloc_chunks(num_chunks) };
         TaperHashMap {
-            mask: chunks.len() - 1,
             chunks,
+            num_chunks,
+            mask: num_chunks - 1,
             size: 0,
         }
     }
@@ -56,11 +76,11 @@ impl TaperHashMap {
     }
 
     pub fn capacity(&self) -> usize {
-        self.chunks.len() * SLOTS_PER_CHUNK
+        self.num_chunks * SLOTS_PER_CHUNK
     }
 
     pub fn num_chunks(&self) -> usize {
-        self.chunks.len()
+        self.num_chunks
     }
 
     #[inline(always)]
@@ -83,9 +103,8 @@ impl TaperHashMap {
     /// Each TaperHashTableChunk is 128 bytes = 2 cache lines.
     #[inline(always)]
     fn prefetch_chunk(&self, pos: usize) {
-        let ptr = self.chunks.as_ptr();
         unsafe {
-            let chunk_ptr = (ptr as *const u8).add(pos * std::mem::size_of::<Chunk>());
+            let chunk_ptr = (self.chunks as *const u8).add(pos * std::mem::size_of::<Chunk>());
             Self::prefetch_read(chunk_ptr);
             Self::prefetch_read(chunk_ptr.add(64));
         }
@@ -156,7 +175,7 @@ impl TaperHashMap {
         let mut collision_batch = 1usize;
 
         loop {
-            let chunk = &mut self.chunks[pos];
+            let chunk = unsafe { &mut *self.chunks.add(pos) };
             let tags = chunk.tags_u64();
 
             // Try tag+key match (probe existing)
@@ -286,13 +305,12 @@ impl TaperHashMap {
         };
 
         // Helper: prefetch
-        let prefetch_idx = |positions: &[usize], idx: usize, end: usize, chunks: &[Chunk]| {
+        let prefetch_idx = |positions: &[usize], idx: usize, end: usize, chunks_ptr: *const Chunk| {
             let pi = idx + PREFETCH_DIST;
             if pi < end {
                 let pos = positions[pi];
-                let ptr = chunks.as_ptr();
                 unsafe {
-                    let chunk_ptr = (ptr as *const u8).add(pos * std::mem::size_of::<Chunk>());
+                    let chunk_ptr = (chunks_ptr as *const u8).add(pos * std::mem::size_of::<Chunk>());
                     Self::prefetch_read(chunk_ptr);
                     Self::prefetch_read(chunk_ptr.add(64));
                 }
@@ -303,7 +321,7 @@ impl TaperHashMap {
         // We need a macro-like approach since we can't borrow self mutably in a closure
         macro_rules! try_emplace_at_pos {
             ($self:expr, $hash:expr, $pos:expr, $row_idx:expr) => {{
-                let chunk = &mut $self.chunks[$pos];
+                let chunk = unsafe { &mut *$self.chunks.add($pos) };
                 let tag_hash = (($hash >> 16) & 0x7F) as u8;
                 let tags = chunk.tags_u64();
                 let mut succeeded = false;
@@ -339,12 +357,12 @@ impl TaperHashMap {
             ($self:expr) => {{
                 // Reset positions for collision elements
                 for i in 0..collision_count {
-                    emplace_positions[i] = ($self.chunks.len() - 1) & (emplace_hash_vals[i] as usize);
+                    emplace_positions[i] = $self.mask & (emplace_hash_vals[i] as usize);
                 }
                 let cur_count = collision_count;
                 collision_count = 0;
                 for idx in 0..cur_count {
-                    prefetch_idx(&emplace_positions, idx, cur_count, &$self.chunks);
+                    prefetch_idx(&emplace_positions, idx, cur_count, $self.chunks);
                     let row_idx = emplace_collisions[idx] as usize;
                     // During rehashed collisions, just try once (guaranteed to succeed post-expand)
                     try_emplace_at_pos!($self, hashes[row_idx], emplace_positions[idx], row_idx);
@@ -354,7 +372,7 @@ impl TaperHashMap {
 
         // First pass: try emplace all rows
         for i in 0..num_rows {
-            prefetch_idx(&emplace_positions, i, num_rows, &self.chunks);
+            prefetch_idx(&emplace_positions, i, num_rows, self.chunks);
 
             let ok = try_emplace_at_pos!(self, emplace_hash_vals[i], emplace_positions[i], i);
 
@@ -381,7 +399,7 @@ impl TaperHashMap {
             collision_batch += 1;
 
             for idx in 0..cur_count {
-                prefetch_idx(&emplace_positions, idx, cur_count, &self.chunks);
+                prefetch_idx(&emplace_positions, idx, cur_count, self.chunks);
                 let row_idx = emplace_collisions[idx] as usize;
 
                 let ok = try_emplace_at_pos!(self, hashes[row_idx], emplace_positions[idx], row_idx);
@@ -485,7 +503,7 @@ impl TaperHashMap {
                 let pos = positions[row_idx as usize];
                 let tag_hash = ((hash >> 16) & 0x7F) as u8;
 
-                let chunk = &self.chunks[pos];
+                let chunk = unsafe { & *self.chunks.add(pos) };
                 let tags = chunk.tags_u64();
 
                 let mut found_candidate = false;
@@ -508,7 +526,7 @@ impl TaperHashMap {
             let cmp_pairs: Vec<(usize, *const u8)> = candidates
                 .iter()
                 .map(|&(row_idx, slot, pos)| {
-                    let sv = &self.chunks[pos].values[slot as usize];
+                    let sv = unsafe { & *self.chunks.add(pos) }.values[slot as usize];
                     (row_idx as usize, sv.get_ptr())
                 })
                 .collect();
@@ -519,7 +537,7 @@ impl TaperHashMap {
             for (cand_idx, &(row_idx, slot, pos)) in candidates.iter().enumerate() {
                 if match_results[cand_idx] {
                     // Key matched → update existing group
-                    let sv = &self.chunks[pos].values[slot as usize];
+                    let sv = &unsafe { & *self.chunks.add(pos) }.values[slot as usize];
                     on_update(row_idx as usize, sv, false);
                 } else {
                     // Tag+hash matched but key didn't → treat as no-match
@@ -533,7 +551,7 @@ impl TaperHashMap {
                 let pos = positions[row_idx as usize];
                 let tag_hash = ((hash >> 16) & 0x7F) as u8;
 
-                let chunk = &mut self.chunks[pos];
+                let chunk = unsafe { &mut *self.chunks.add(pos) };
                 let tags = chunk.tags_u64();
 
                 if let Some(i) = BitMask::match_empty(tags).next() {
@@ -566,23 +584,29 @@ impl TaperHashMap {
 
     /// Expand capacity by 2x and rehash all elements using iterative batch rehash.
     fn expand(&mut self) {
-        let new_len = self.chunks.len() * 2;
-        let old_chunks = std::mem::replace(
-            &mut self.chunks,
-            (0..new_len).map(|_| Chunk::new()).collect(),
-        );
-        self.mask = self.chunks.len() - 1;
+        let new_len = self.num_chunks * 2;
+        let old_chunks = self.chunks;
+        let old_num = self.num_chunks;
+
+        // Allocate new chunk array (same as OmniOperator ExpandCapacityIteratively)
+        self.chunks = unsafe { alloc_chunks(new_len) };
+        self.num_chunks = new_len;
+        self.mask = new_len - 1;
         self.size = 0;
 
         // Collect all occupied entries from old chunks
-        let mut entries: Vec<(u64, SlotValue)> = Vec::with_capacity(old_chunks.len() * SLOTS_PER_CHUNK);
-        for chunk in &old_chunks {
+        let mut entries: Vec<(u64, SlotValue)> = Vec::with_capacity(old_num * SLOTS_PER_CHUNK);
+        for ci in 0..old_num {
+            let chunk = unsafe { &*old_chunks.add(ci) };
             for slot_idx in 0..SLOTS_PER_CHUNK {
                 if chunk.tags[slot_idx] != 0x80 {
                     entries.push((chunk.keys[slot_idx], chunk.values[slot_idx]));
                 }
             }
         }
+
+        // Free old chunks (same as OmniOperator: free(oldChunks))
+        unsafe { libc::free(old_chunks as *mut libc::c_void); }
 
         let n = entries.len();
         if n == 0 {
@@ -622,7 +646,7 @@ impl TaperHashMap {
                 let pos = positions[entry_idx];
                 let tag_hash = ((hash >> 16) & 0x7F) as u8;
 
-                let chunk = &mut self.chunks[pos];
+                let chunk = unsafe { &mut *self.chunks.add(pos) };
                 let tags = chunk.tags_u64();
 
                 // During rehash: insert-only, no key comparison needed
