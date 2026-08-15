@@ -15,7 +15,7 @@
 //!   - Selectivity: 0.1 ~ 0.9
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand_mt::Mt19937GenRand64;
 use taper_hashmap::column_marshaller::{TaperColumnSerializeHandler, ColumnDesc, ColumnInput};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
@@ -49,7 +49,7 @@ struct MixedBenchData {
 }
 
 /// Generate random string of given average length (8~13 bytes)
-fn gen_string(_rng: &mut StdRng, base: &str, id: usize, col: usize) -> Vec<u8> {
+fn gen_string( base: &str, id: usize, col: usize) -> Vec<u8> {
     format!("{}_{}_c{}", base, id, col).into_bytes()
 }
 
@@ -59,11 +59,11 @@ fn generate_mixed_data(
     num_keys: usize,
     num_probe_rows: usize,
     selectivity: f64,
-    rng: &mut StdRng,
+    rng: &mut Mt19937GenRand64,
 ) -> MixedBenchData {
     // Build keys
     let mut build_str_cols: Vec<Vec<Vec<u8>>> = (0..num_str_cols)
-        .map(|c| (0..num_keys).map(|i| gen_string(rng, "key", i, c)).collect())
+        .map(|c| (0..num_keys).map(|i| gen_string("key", i, c)).collect())
         .collect();
     let mut build_int_cols: Vec<Vec<i64>> = (0..num_int_cols)
         .map(|c| (0..num_keys).map(|i| i as i64 * (97 + c as i64 * 31) + 1).collect())
@@ -94,7 +94,7 @@ fn generate_mixed_data(
     let mut probe_hashes: Vec<u64> = Vec::with_capacity(num_probe_rows);
 
     for _ in 0..num_hits {
-        let idx = rng.random_range(0..num_keys);
+        let idx = (rng.next_u64() as usize) % num_keys;
         for c in 0..num_str_cols { probe_str_cols[c].push(build_str_cols[c][idx].clone()); }
         for c in 0..num_int_cols { probe_int_cols[c].push(build_int_cols[c][idx]); }
         probe_hashes.push(build_hashes[idx]);
@@ -117,7 +117,7 @@ fn generate_mixed_data(
 
     // Shuffle probe
     let mut order: Vec<usize> = (0..num_probe_rows).collect();
-    for i in (1..num_probe_rows).rev() { order.swap(i, rng.random_range(0..=i)); }
+    for i in (1..num_probe_rows).rev() { order.swap(i, (rng.next_u64() as usize) % (i + 1)); }
     let mut probe_str_cols: Vec<Vec<Vec<u8>>> = (0..num_str_cols).map(|c| order.iter().map(|&i| probe_str_cols[c][i].clone()).collect()).collect();
     let probe_int_cols: Vec<Vec<i64>> = (0..num_int_cols).map(|c| order.iter().map(|&i| probe_int_cols[c][i]).collect()).collect();
     let probe_hashes: Vec<u64> = order.iter().map(|&i| probe_hashes[i]).collect();
@@ -196,7 +196,7 @@ fn bench_hashagg(c: &mut Criterion) {
             for &load_factor in &[0.5, 0.75] {
                 let num_keys = (ht_size as f64 * load_factor) as usize;
                 for &selectivity in &[0.1, 0.3, 0.5, 0.7, 0.9] {
-                    let mut rng = StdRng::seed_from_u64(42);
+                    let mut rng = Mt19937GenRand64::new(42);
                     let data = generate_mixed_data(num_str, num_int, num_keys, num_probe_rows, selectivity, &mut rng);
                     let param = format!("{}_ht={}_lf={:.2}_sel={:.1}", type_name, ht_size, load_factor, selectivity);
 

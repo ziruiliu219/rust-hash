@@ -1,7 +1,7 @@
 //! Quick profiling binary: runs taper on 4str_0int_ht=65536 multiple times for sampling.
 use taper_hashmap::column_marshaller::{TaperColumnSerializeHandler, ColumnDesc, ColumnInput};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand_mt::Mt19937GenRand64;
 
 fn hash_bytes(data: &[u8], seed: u64) -> u64 { xxh3_64_with_seed(data, seed) }
 fn hash_combine(seed: u64, val: i64) -> u64 { xxh3_64_with_seed(&val.to_le_bytes(), seed) }
@@ -13,7 +13,7 @@ fn main() {
     let num_keys = (ht_size as f64 * 0.5) as usize;
     let num_probe = 1_000_000usize;
     let selectivity = 0.5f64;
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = Mt19937GenRand64::new(42);
 
     // Generate data (same logic as benchmark)
     let build_str: Vec<Vec<Vec<u8>>> = (0..num_str)
@@ -32,7 +32,7 @@ fn main() {
     let mut probe_hashes: Vec<u64> = Vec::with_capacity(num_probe);
 
     for _ in 0..num_hits {
-        let idx = rng.random_range(0..num_keys);
+        let idx = (rng.next_u64() as usize) % num_keys;
         for c in 0..num_str { probe_str[c].push(build_str[c][idx].clone()); }
         probe_hashes.push(build_hashes[idx]);
     }
@@ -48,7 +48,7 @@ fn main() {
 
     // Shuffle
     let mut order: Vec<usize> = (0..num_probe).collect();
-    for i in (1..num_probe).rev() { order.swap(i, rng.random_range(0..=i)); }
+    for i in (1..num_probe).rev() { order.swap(i, (rng.next_u64() as usize) % (i + 1)); }
     let probe_str: Vec<Vec<Vec<u8>>> = (0..num_str).map(|c| order.iter().map(|&i| probe_str[c][i].clone()).collect()).collect();
     let probe_hashes: Vec<u64> = order.iter().map(|&i| probe_hashes[i]).collect();
     let probe_values: Vec<i64> = (0..num_probe).map(|i| (i % 1000) as i64).collect();
