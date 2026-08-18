@@ -472,7 +472,7 @@ impl TaperColumnSerializeHandler {
             unsafe { std::ptr::write_bytes(self.merged_cache.as_mut_ptr(), 0, cache_size); }
             let mut out_ptrs = vec![std::ptr::null::<u8>(); num_varchar];
             for wi in 0..count {
-                let idx = working_indices[wi] as usize;
+                let idx: usize = working_indices[wi] as usize;
                 get_all_merged_varchar_ptrs(
                     self.groups[idx], self.varchar_slot_col_offset,
                     &self.varchar_col_descs, &mut out_ptrs,
