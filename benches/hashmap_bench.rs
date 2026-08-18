@@ -147,28 +147,33 @@ fn generate_mixed_data(
 // ═══════════════════════════════════════════════════════════════════
 
 #[inline(never)]
-fn run_taper_mixed(data: &MixedBenchData, ht_size: usize) {
-    // Build schema
+fn run_taper_mixed(data: &MixedBenchData, num_chunks: usize) {
+    const BATCH_SIZE: usize = 410;
+
     let mut col_descs: Vec<ColumnDesc> = Vec::new();
     for _ in 0..data.num_str_cols { col_descs.push(ColumnDesc::Varchar); }
     for _ in 0..data.num_int_cols { col_descs.push(ColumnDesc::Int64); }
 
-    let mut table = TaperColumnSerializeHandler::new(&col_descs, 8, ht_size);
+    let mut table = TaperColumnSerializeHandler::new(&col_descs, 8, num_chunks);
+    let total_rows = data.hashes.len();
+    let num_batches = (total_rows + BATCH_SIZE - 1) / BATCH_SIZE;
 
-    // Build column inputs
-    let str_slices: Vec<Vec<&[u8]>> = (0..data.num_str_cols)
-        .map(|c| data.str_cols[c].iter().map(|s| s.as_slice()).collect())
-        .collect();
+    for batch_idx in 0..num_batches {
+        let start = batch_idx * BATCH_SIZE;
+        let end = (start + BATCH_SIZE).min(total_rows);
 
-    let mut columns: Vec<ColumnInput> = Vec::new();
-    for c in 0..data.num_str_cols {
-        columns.push(ColumnInput::Varchar(&str_slices[c]));
+        let batch_hashes = &data.hashes[start..end];
+        let batch_values = &data.values[start..end];
+        let str_slices: Vec<Vec<&[u8]>> = (0..data.num_str_cols)
+            .map(|c| data.str_cols[c][start..end].iter().map(|s| s.as_slice()).collect())
+            .collect();
+
+        let mut columns: Vec<ColumnInput> = Vec::new();
+        for c in 0..data.num_str_cols { columns.push(ColumnInput::Varchar(&str_slices[c])); }
+        for c in 0..data.num_int_cols { columns.push(ColumnInput::Int64(&data.int_cols[c][start..end])); }
+
+        table.emplace_table_with_decode(batch_hashes, &columns, batch_values);
     }
-    for c in 0..data.num_int_cols {
-        columns.push(ColumnInput::Int64(&data.int_cols[c]));
-    }
-
-    table.emplace_table_with_decode(&data.hashes, &columns, &data.values);
     black_box(table.num_groups());
 }
 
@@ -200,7 +205,13 @@ fn bench_hashagg(c: &mut Criterion) {
                     let data = generate_mixed_data(num_str, num_int, num_keys, num_probe_rows, selectivity, &mut rng);
                     let param = format!("{}_ht={}_lf={:.2}_sel={:.1}", type_name, ht_size, load_factor, selectivity);
 
-                    group.bench_with_input(BenchmarkId::new("taper", &param), &data, |b, d| { b.iter(|| run_taper_mixed(black_box(d), ht_size)); });
+                    // Pre-allocate: distinct_keys / 0.85 / 8 chunks (no rehash)
+                    let num_misses = num_probe_rows - (num_probe_rows as f64 * selectivity) as usize;
+                    let distinct_keys = num_keys + num_misses;
+                    let min_slots = ((distinct_keys as f64 / 0.85) as usize).max(8);
+                    let num_chunks = ((min_slots + 7) / 8).next_power_of_two();
+
+                    group.bench_with_input(BenchmarkId::new("taper", &param), &data, |b, d| { b.iter(|| run_taper_mixed(black_box(d), num_chunks)); });
                 }
             }
         }
